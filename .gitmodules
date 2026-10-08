@@ -1,0 +1,3 @@
+[submodule "lib/wch_low_level_drivers"]
+	path = lib/wch_low_level_drivers
+	url = https://git.w8k.ru/ComponentsOffline/wch_low_level_drivers.git

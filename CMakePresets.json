@@ -1,0 +1,8 @@
+{
+  "version": 3,
+  "configurePresets": [{
+    "name": "firmware", "generator": "Ninja", "binaryDir": "${sourceDir}/build/firmware",
+    "toolchainFile": "${sourceDir}/cmake/toolchain.cmake"
+  }],
+  "buildPresets": [{"name": "firmware", "configurePreset": "firmware"}]
+}
