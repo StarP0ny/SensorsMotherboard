@@ -1,0 +1,22 @@
+collector:
+  port: 8765
+  runs_dir: runs
+  record_default: [scd, sht]
+devices:
+  motherboard:
+    driver: vgw
+    name: SensorsMotherboard
+    settings:
+      port: COM27  # USB CDC текущей платы; проверить номер на другом ПК
+      baud: 460800
+      ping_ms: 1000
+      missed_pings: 1
+      tx_interval_us: 0
+      sync_interval_ms: 30000
+    children:
+      scd:
+        driver: scd41
+        settings: {sensor_id: 1}
+      sht:
+        driver: sht41
+        settings: {sensor_id: 2}
