@@ -25,3 +25,12 @@ add_custom_command(TARGET firmware POST_BUILD
   COMMAND ${CMAKE_OBJCOPY} -O ihex $<TARGET_FILE:firmware> firmware.hex
   COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:firmware> firmware.bin
   COMMAND ${CMAKE_SIZE} $<TARGET_FILE:firmware>)
+
+add_custom_target(flash
+  COMMAND "${WK_SDK_PATH}/WCH/OpenOCD/bin/openocd.exe"
+    -f "${WK_SDK_PATH}/WCH/OpenOCD/bin/wch-riscv.cfg"
+    -c "program firmware.elf verify reset exit"
+  WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+  DEPENDS firmware
+  COMMENT "Flashing SensorsMotherboard via WCH-Link (verify and reset)"
+  USES_TERMINAL VERBATIM)

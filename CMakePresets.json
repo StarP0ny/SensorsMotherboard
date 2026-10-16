@@ -2,7 +2,13 @@
   "version": 3,
   "configurePresets": [{
     "name": "firmware", "generator": "Ninja", "binaryDir": "${sourceDir}/build/firmware",
-    "toolchainFile": "${sourceDir}/cmake/toolchain.cmake"
+    "displayName": "SensorsMotherboard (WCH GCC12)",
+    "toolchainFile": "${sourceDir}/cmake/toolchain.cmake",
+    "cacheVariables": {
+      "WK_SDK_PATH": "$penv{WK_SDK_PATH}",
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_EXPORT_COMPILE_COMMANDS": true
+    }
   }],
   "buildPresets": [{"name": "firmware", "configurePreset": "firmware"}]
 }

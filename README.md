@@ -9,11 +9,13 @@
 
 ```powershell
 git submodule update --init --recursive
-cmake --preset firmware -DWK_SDK_PATH=C:/Users/StarPony/Documents/Welrok/wk-sdk
+cmake --preset firmware
 cmake --build --preset firmware
 ```
 
-Можно задать WK_SDK_PATH переменной окружения. Результаты в
+По умолчанию SDK берётся из `%USERPROFILE%/Documents/Welrok/wk-sdk`.
+Другой путь можно задать переменной окружения `WK_SDK_PATH` или аргументом
+`cmake --preset firmware -DWK_SDK_PATH=...`. Результаты в
 `build/firmware/firmware.elf`, `.hex`, `.bin`. Нужны CMake ≥3.21, Ninja,
 WCH RISCV_GCC12 из Welrok SDK. Локальные пути к ktz не нужны.
 
@@ -32,8 +34,13 @@ PB1 показывает автоматический режим. Первый �
 Из каталога SensorsMotherboard после сборки:
 
 ```powershell
-& 'C:/Users/StarPony/Documents/Welrok/wk-sdk/WCH/OpenOCD-wch/bin/openocd.exe' -f 'C:/Users/StarPony/Documents/Welrok/wk-sdk/WCH/OpenOCD-wch/bin/wch-riscv.cfg' -c 'program build/firmware/firmware.elf verify reset exit'
+cmake --build --preset firmware --target flash
 ```
+
+В VS Code: **Terminal → Run Task → SensorsMotherboard: flash (WCH-Link)**.
+Задача сначала настраивает и собирает прошивку, затем записывает ELF,
+проверяет запись и перезапускает плату. Требуется подключённый WCH-Link.
+Для сборки без записи есть задача **SensorsMotherboard: build**.
 
 На текущем стенде проверены запись с верификацией, USB CDC (COM27), HELLO,
 ENUM, START/STOP, пинги и синхронизация UTC. За 12 секунд обмена потерь
