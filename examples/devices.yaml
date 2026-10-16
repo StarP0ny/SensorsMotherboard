@@ -1,7 +1,7 @@
 collector:
   port: 8765
   runs_dir: runs
-  record_default: [scd, sht]
+  record_default: [scd, sht, sdp]
 devices:
   motherboard:
     driver: vgw
@@ -20,3 +20,6 @@ devices:
       sht:
         driver: sht41
         settings: {sensor_id: 2}
+      sdp:
+        driver: sdp810
+        settings: {sensor_id: 3}
