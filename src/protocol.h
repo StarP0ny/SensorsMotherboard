@@ -8,15 +8,22 @@
 #define PROTO_OVERHEAD 28U
 #define PROTO_MAX_FRAME (PROTO_MAX_PAYLOAD + PROTO_OVERHEAD)
 #define UTC_THRESHOLD_US UINT64_C(631152000000000)
+#ifdef __cplusplus
+extern "C" {
+#endif
 enum MessageType {
     HELLO_REQ=0x0001, HELLO=0x0002, ENUM_REQ=0x0010, ENUM_REPLY=0x0011,
     GET_CONFIG=0x0020, SET_CONFIG=0x0021, CONFIG=0x0022,
     START=0x0030, STOP=0x0031, DATA=0x0040, STATUS=0x0041, EVENT=0x0042,
     TIME_SYNC_REQ=0x0050, TIME_SYNC_RESP=0x0051, TIME_SYNC_SET=0x0052,
     LOG_INFO_REQ=0x0060, LOG_INFO=0x0061, LOG_READ=0x0062, LOG_DATA=0x0063,
-    LOG_ACK=0x0064, RESULT=0x0070, PING=0x0080, PONG=0x0081
+    LOG_ACK=0x0064, RESULT=0x0070, PING=0x0080, PONG=0x0081,
+    I2C_SCAN_REQ=0x0090, I2C_SCAN_REPLY=0x0091,
+    TOPOLOGY_REQ=0x00a0, TOPOLOGY_REPLY=0x00a1, SENSOR_ASSIGN=0x00a2,
+    SENSOR_REMOVE=0x00a3, MUX_ASSIGN=0x00a4, CONFIG_SAVE=0x00a5,
+    IDENTIFY_REQ=0x00a6, IDENTIFY_REPLY=0x00a7
 };
-enum ResultCode { RES_OK, RES_BAD_LENGTH, RES_UNSUPPORTED, RES_BAD_VALUE, RES_BUSY };
+enum ResultCode { RES_OK, RES_BAD_LENGTH, RES_UNSUPPORTED, RES_BAD_VALUE, RES_BUSY, RES_I2C, RES_STORAGE };
 uint16_t rd16(const uint8_t *p);
 uint32_t rd32(const uint8_t *p);
 uint64_t rd64(const uint8_t *p);
@@ -37,3 +44,7 @@ void proto_feed(ProtoParser *p, const uint8_t *data, size_t length);
 void proto_expire(ProtoParser *p); /* abandon an incomplete frame after an inter-byte gap */
 size_t proto_encode(uint8_t *out, uint16_t type, uint32_t seq, uint64_t time,
                     const uint8_t *payload, uint16_t length);
+
+#ifdef __cplusplus
+}
+#endif

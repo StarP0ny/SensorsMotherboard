@@ -3,7 +3,9 @@
 #include "board_config.h"
 #include "protocol.h"
 #include "sensors.h"
+#include "i2c_bus.h"
 #include "transport.h"
+#include "config_store.h"
 #include "ch32v30x.h"
 #include <string.h>
 typedef struct {
@@ -17,6 +19,12 @@ typedef struct {
 } Session;
 static Session sessions[2];
 static Session *owner;
+static Session *scan_owner;
+static Session *identify_owner;
+static uint32_t identify_request;
+static uint8_t identify_path[4];
+static uint64_t identify_deadline;
+static uint8_t scan_data[119],scan_address,scan_bus,scan_mux,scan_channel,scan_header;
 static bool auto_mode,button_raw,button_stable;
 static uint64_t button_changed,next_status;
 static uint16_t requested_mask;
@@ -46,15 +54,47 @@ static void flush_batch(void) {
     }
     batch_used=2; batch_count=0;
 }
-static uint16_t run_mask(void) { return (auto_mode?3:0)|((owner&&owner->linked)?requested_mask:0); }
+static uint16_t run_mask(void) { return (auto_mode?sensors_mask():0)|((owner&&owner->linked)?requested_mask:0); }
 static void status(Session *s) {
     uint8_t data[20]={0}; data[0]=auto_mode; data[1]=s->linked; wr16(data+2,run_mask());
     wr32(data+4,s->missed); wr32(data+8,transport_drops()); wr32(data+12,s->parser.bad_frames);
-    wr16(data+16,(sensors[0].present?1:0)|(sensors[1].present?2:0));
+    wr16(data+16,sensors_present());
     /* bits: automatic=1, ping-linked=2; reserved journal fields remain zero */
     send(s,STATUS,data,sizeof(data));
 }
+static void identify_finish(uint16_t model) {
+    Session *target=identify_owner; identify_owner=nullptr;
+    if(!target) return;
+    uint8_t data[10]; wr32(data,identify_request); memcpy(data+4,identify_path,4); wr16(data+8,model);
+    sensors_identify_stop(); send(target,IDENTIFY_REPLY,data,sizeof(data));
+}
+static void descriptor(uint8_t *d,const Sensor &sensor) {
+    wr16(d,sensor.id); wr16(d+2,sensor.model); d[4]=sensor.bus; d[5]=sensor.mux;
+    d[6]=sensor.channel; d[7]=sensor.address; wr32(d+8,sensor.period_us);
+}
+static void snapshot(uint8_t data[CONFIG_BYTES]) {
+    memset(data,0,CONFIG_BYTES); wr32(data,0x32504f54); data[4]=i2c_muxes[0]; data[5]=i2c_muxes[1];
+    for(unsigned i=0;i<SENSOR_COUNT;i++) descriptor(data+8+i*12,sensors[i]);
+}
+static void sample(uint16_t,uint64_t,const uint16_t *,uint16_t);
+static void sensor_error(uint16_t,uint16_t);
+static void restore(void) {
+    uint8_t data[CONFIG_BYTES];
+    if(!config_load(data) || rd32(data)!=0x32504f54) return;
+    for(auto &sensor:sensors) sensor={};
+    i2c_muxes[0]=data[4]; i2c_muxes[1]=data[5];
+    for(unsigned i=0;i<SENSOR_COUNT;i++) {
+        const uint8_t *d=data+8+i*12;
+        if(rd16(d+2) && !sensors_assign(rd16(d),rd16(d+2),d[4],d[5],d[6],d[7],rd32(d+8))) {
+            i2c_muxes[0]=i2c_muxes[1]=0; sensors_init(sample,sensor_error); return;
+        }
+    }
+}
 static void sample(uint16_t id,uint64_t mono,const uint16_t *words,uint16_t count) {
+    if(id==0) {
+        if(identify_owner) identify_finish(identify_path[3]==0x62?1:(identify_path[3]>=0x44 && identify_path[3]<=0x46)?2:3);
+        return;
+    }
     if(!owner || !owner->linked) return; /* offline journal is the next implementation stage */
     uint64_t time=wire_time(mono); uint16_t size=8+count*2;
     if(batch_count && (time<batch_base || time-batch_base>UINT32_MAX || batch_used+size>PROTO_MAX_PAYLOAD)) flush_batch();
@@ -65,6 +105,7 @@ static void sample(uint16_t id,uint64_t mono,const uint16_t *words,uint16_t coun
     if(!tx_interval_us) flush_batch();
 }
 static void sensor_error(uint16_t id,uint16_t error) {
+    if(id==0) { identify_finish(0); return; }
     if(owner && owner->linked) { uint8_t data[4]; wr16(data,id); wr16(data+2,error); send(owner,EVENT,data,4); }
 }
 static void config_reply(Session *s,uint32_t req,uint16_t object) {
@@ -76,7 +117,7 @@ static void config_reply(Session *s,uint32_t req,uint16_t object) {
     } else { wr16(data+6,1); wr16(data+8,16); wr32(data+10,sensors[object-1].period_us); send(s,CONFIG,data,14); }
 }
 static void handle(void *ctx,uint16_t type,uint32_t seq,uint64_t time,const uint8_t *p,uint16_t n) {
-    Session *s=ctx; uint64_t now=mono_us();
+    Session *s=static_cast<Session *>(ctx); uint64_t now=mono_us();
     if(type==HELLO_REQ) {
         if(n!=2) { result(s,seq,RES_BAD_LENGTH); return; }
         if(rd16(p)!=PROTO_VERSION) { result(s,seq,RES_UNSUPPORTED); return; }
@@ -84,12 +125,62 @@ static void handle(void *ctx,uint16_t type,uint32_t seq,uint64_t time,const uint
         flush_batch(); owner=s; requested_mask=0;
         s->hello=true; s->linked=true; s->pending_ping=false; s->missed=0; s->next_ping=now+(uint64_t)ping_ms*1000;
         uint8_t data[38]; wr32(data,seq); wr16(data+4,PROTO_VERSION);
-        wr16(data+6,0); wr16(data+8,1); wr16(data+10,0); wr16(data+12,PROTO_MAX_PAYLOAD);
+        wr16(data+6,0); wr16(data+8,2); wr16(data+10,0); wr16(data+12,PROTO_MAX_PAYLOAD);
         board_uid(data+14); wr32(data+26,RCC->RSTSCKR); wr32(data+30,boot_id);
-        wr32(data+34,3); /* capabilities: acquisition + time sync; no flash log yet */
+        wr32(data+34,11); /* capabilities: acquisition + time sync; no flash log yet */
         send(s,HELLO,data,sizeof(data)); return;
     }
     if(!s->hello || owner!=s) { result(s,seq,RES_BUSY); return; }
+    if(type==TOPOLOGY_REQ) {
+        if(n) { result(s,seq,RES_BAD_LENGTH); return; }
+        uint8_t data[232]={0}; wr32(data,seq); unsigned pos=5,count=0;
+        for(unsigned bus=1;bus<=2;bus++) for(unsigned i=0;i<8;i++) if(i2c_muxes[bus-1]&(1U<<i)) {
+            data[pos++]=bus; data[pos++]=0x70+i; count++;
+        }
+        data[4]=count; unsigned count_pos=pos++; count=0;
+        for(const auto &sensor:sensors) if(sensor.model) { descriptor(data+pos,sensor); pos+=12; count++; }
+        data[count_pos]=count; send(s,TOPOLOGY_REPLY,data,pos); return;
+    }
+    if(type==IDENTIFY_REQ) {
+        if(n!=4) { result(s,seq,RES_BAD_LENGTH); return; }
+        if(scan_owner || identify_owner || run_mask()) { result(s,seq,RES_BUSY); return; }
+        if(!i2c_path_valid(p[0],p[1],p[2])) { result(s,seq,RES_BAD_VALUE); return; }
+        memcpy(identify_path,p,4); identify_owner=s; identify_request=seq; identify_deadline=mono_us()+6500000;
+        if(!sensors_identify(p[0],p[1],p[2],p[3])) identify_finish(0);
+        return;
+    }
+    if(type==SENSOR_ASSIGN || type==SENSOR_REMOVE || type==MUX_ASSIGN || type==CONFIG_SAVE) {
+        if(run_mask() || scan_owner || identify_owner) { result(s,seq,RES_BUSY); return; }
+        sensors_poll(0);
+        bool ok=false;
+        if(type==SENSOR_ASSIGN && n==12) ok=sensors_assign(rd16(p),rd16(p+2),p[4],p[5],p[6],p[7],rd32(p+8));
+        else if(type==SENSOR_REMOVE && n==2) ok=sensors_remove(rd16(p));
+        else if(type==MUX_ASSIGN && n==3 && p[2]<=1) {
+            bool used=false;
+            for(const auto &sensor:sensors) if(sensor.model && sensor.bus==p[0] && sensor.mux==p[1]) used=true;
+            if(p[2] || !used) {
+                if((p[0]==1 || p[0]==2) && p[1]>=0x70 && p[1]<=0x77 &&
+                   !i2c_mux_set(p[0],p[1],p[2])) { result(s,seq,RES_I2C); return; }
+                ok=(p[0]==1 || p[0]==2) && p[1]>=0x70 && p[1]<=0x77;
+            }
+        } else if(type==CONFIG_SAVE && n==0) {
+            uint8_t data[CONFIG_BYTES]; snapshot(data); ok=config_save(data);
+            result(s,seq,ok?RES_OK:RES_STORAGE); return;
+        } else { result(s,seq,RES_BAD_LENGTH); return; }
+        result(s,seq,ok?RES_OK:RES_BAD_VALUE); return;
+    }
+    if(type==I2C_SCAN_REQ) {
+        if(n!=1 && n!=2 && n!=3) { result(s,seq,RES_BAD_LENGTH); return; }
+        uint8_t bus=n==1?1:p[0],channel=p[n-1],mux=n==3?p[1]:(channel==255?0:MUX_ADDRESS);
+        if(!i2c_path_valid(bus,mux,channel)) {
+            result(s,seq,RES_BAD_VALUE); return;
+        }
+        if(scan_owner || identify_owner) { result(s,seq,RES_BUSY); return; }
+        scan_owner=s; scan_address=0x08; wr32(scan_data,seq);
+        scan_bus=bus; scan_mux=mux; scan_channel=channel; scan_header=n==1?6:7;
+        if(n>=2) scan_data[4]=bus;
+        scan_data[scan_header-2]=channel; scan_data[scan_header-1]=0; return;
+    }
     if(type==PING) {
         if(n) { result(s,seq,RES_BAD_LENGTH); return; }
         s->linked=true; s->missed=0; uint8_t data[4]; wr32(data,seq); send(s,PONG,data,4); return;
@@ -103,35 +194,34 @@ static void handle(void *ctx,uint16_t type,uint32_t seq,uint64_t time,const uint
     }
     if(type==ENUM_REQ) {
         if(n) { result(s,seq,RES_BAD_LENGTH); return; }
-        uint8_t data[38]={0}; wr32(data,seq); wr16(data+4,2);
-        for(unsigned i=0;i<2;i++) {
-            uint8_t *d=data+6+i*16; wr16(d,i+1); wr16(d+2,i+1); d[4]=1; d[5]=MUX_ADDRESS;
-            d[6]=i?SHT_CHANNEL:SCD_CHANNEL; d[7]=i?0x44:0x62;
-            wr32(d+8,sensors[i].period_us); wr16(d+12,sensors[i].present);
+        uint8_t data[6+16*SENSOR_COUNT]={0}; wr32(data,seq); unsigned count=0;
+        for(const auto &sensor:sensors) if(sensor.model) {
+            uint8_t *d=data+6+count++*16; descriptor(d,sensor); wr16(d+12,sensor.present);
         }
-        send(s,ENUM_REPLY,data,sizeof(data)); return;
+        wr16(data+4,count);
+        send(s,ENUM_REPLY,data,6+count*16); return;
     }
     if(type==GET_CONFIG) {
         if(n!=2) { result(s,seq,RES_BAD_LENGTH); return; }
-        if(rd16(p)>2) { result(s,seq,RES_BAD_VALUE); return; }
+        if(rd16(p)>SENSOR_COUNT || (rd16(p) && !sensors[rd16(p)-1].model)) { result(s,seq,RES_BAD_VALUE); return; }
         config_reply(s,seq,rd16(p)); return;
     }
     if(type==SET_CONFIG) {
         if(n<4 || n!=4+rd16(p+2)*6U) { result(s,seq,RES_BAD_LENGTH); return; }
         uint16_t object=rd16(p),count=rd16(p+2);
         uint32_t values[4]={ping_ms,miss_limit,tx_interval_us,sync_interval_ms};
-        uint32_t period=object>=1&&object<=2?sensors[object-1].period_us:0;
+        uint32_t period=object>=1&&object<=SENSOR_COUNT?sensors[object-1].period_us:0;
         for(unsigned i=0;i<count;i++) {
             uint16_t key=rd16(p+4+i*6); uint32_t value=rd32(p+6+i*6);
             if(object==0 && key>=1 && key<=4) {
                 if((key==1 && (value<100 || value>60000)) || (key==2 && (value<1 || value>100)) ||
                    (key==3 && value>1000000) || (key==4 && value && (value<1000 || value>3600000))) goto bad_config;
                 values[key-1]=value;
-            } else if(object>=1 && object<=2 && key==16 &&
-                      value>=(object==1?5000000U:10000U) && value<=60000000U) period=value;
+            } else if(object>=1 && object<=SENSOR_COUNT && key==16 &&
+                      value>=(sensors[object-1].model==1?5000000U:10000U) && value<=60000000U) period=value;
             else goto bad_config;
         }
-        if(object>2) goto bad_config;
+        if(object>SENSOR_COUNT) goto bad_config;
         flush_batch();
         if(object==0) {
             ping_ms=values[0]; miss_limit=values[1]; tx_interval_us=values[2]; sync_interval_ms=values[3];
@@ -142,9 +232,9 @@ static void handle(void *ctx,uint16_t type,uint32_t seq,uint64_t time,const uint
     }
     if(type==START || type==STOP) {
         if(n<2 || n!=2+rd16(p)*2U) { result(s,seq,RES_BAD_LENGTH); return; }
-        uint16_t mask=rd16(p)?0:3;
+        uint16_t mask=rd16(p)?0:sensors_mask();
         for(unsigned i=0;i<rd16(p);i++) {
-            uint16_t id=rd16(p+2+i*2); if(id<1 || id>2) { result(s,seq,RES_BAD_VALUE); return; }
+            uint16_t id=rd16(p+2+i*2); if(id<1 || id>SENSOR_COUNT || !sensors[id-1].model) { result(s,seq,RES_BAD_VALUE); return; }
             mask|=1U<<(id-1);
         }
         if(type==START) requested_mask|=mask; else requested_mask&=~mask;
@@ -169,7 +259,7 @@ void app_init(void) {
     for(unsigned i=0;i<2;i++) { sessions[i].port=i; proto_init(&sessions[i].parser,handle,&sessions[i]); }
     button_raw=button_stable=board_button_pressed(); button_changed=mono_us();
     boot_id=(uint32_t)mono_us()^RCC->RSTSCKR;
-    sensors_init(sample,sensor_error);
+    sensors_init(sample,sensor_error); restore();
 }
 void app_poll(void) {
     uint64_t now=mono_us(); uint8_t data[128];
@@ -192,6 +282,22 @@ void app_poll(void) {
         owner->next_ping=now+(uint64_t)ping_ms*1000;
     }
     sensors_poll(run_mask());
+    if(identify_owner) {
+        if(mono_us()>=identify_deadline) identify_finish(0);
+        else sensors_identify_poll();
+    }
+    /* One address per loop keeps pings, USB and sensor state machines running. */
+    if(scan_owner) {
+        int found=i2c_probe(scan_bus,scan_mux,scan_channel,scan_address);
+        if(found<0) {
+            result(scan_owner,rd32(scan_data),RES_I2C); scan_owner=NULL;
+        } else {
+            if(found) scan_data[scan_header+scan_data[scan_header-1]++]=scan_address;
+            if(++scan_address==0x78) {
+                send(scan_owner,I2C_SCAN_REPLY,scan_data,scan_header+scan_data[scan_header-1]); scan_owner=NULL;
+            }
+        }
+    }
     if(batch_count && mono_us()>=batch_due) flush_batch();
     if(owner && owner->linked && now>=next_status) { status(owner); next_status=now+1000000; }
 }

@@ -8,4 +8,5 @@
 #define USE_AFIO
 #define USE_TIM2
 #define USE_I2C1
+#define USE_I2C2
 #define USE_USART1

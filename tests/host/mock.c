@@ -3,6 +3,7 @@
 #include "sensors.h"
 #include "app.h"
 #include "i2c_bus.h"
+#include "config_store.h"
 #include "ch32v30x.h"
 #include <string.h>
 MockRCC mock_rcc;
@@ -10,8 +11,9 @@ static uint64_t now;
 static bool button,led;
 static uint8_t incoming[2048],outgoing[65536];
 static size_t incoming_len,outgoing_len;
-static uint16_t last_command[2];
+static uint16_t last_command[2][128];
 static int fail_i2c,bad_crc;
+static int fail_scan_bus;
 static uint16_t asc=99;
 uint64_t mono_us(void) { return now; }
 bool board_button_pressed(void) { return button; }
@@ -28,20 +30,21 @@ bool transport_send(unsigned port,const uint8_t *data,size_t length,bool control
     if(port || outgoing_len+length>sizeof(outgoing)) return false;
     memcpy(outgoing+outgoing_len,data,length); outgoing_len+=length; return true;
 }
-bool sensor_write(uint8_t channel,uint8_t addr,const uint8_t *data,size_t n) {
-    (void)addr;
+bool sensor_write(uint8_t bus,uint8_t mux,uint8_t channel,uint8_t addr,const uint8_t *data,size_t n) {
+    if(!i2c_path_valid(bus,mux,channel)) return false;
     if(fail_i2c) return false;
-    last_command[channel]=n==1?data[0]:(uint16_t)((data[0]<<8)|data[1]);
-    if(last_command[channel]==0x2416 && n==5) asc=(data[2]<<8)|data[3];
+    last_command[bus-1][addr]=n==1?data[0]:(uint16_t)((data[0]<<8)|data[1]);
+    if(last_command[bus-1][addr]==0x2416 && n==5) asc=(data[2]<<8)|data[3];
     return true;
 }
-bool sensor_read(uint8_t channel,uint8_t addr,uint8_t *data,size_t n) {
-    (void)addr;
+bool sensor_read(uint8_t bus,uint8_t mux,uint8_t channel,uint8_t addr,uint8_t *data,size_t n) {
+    if(!i2c_path_valid(bus,mux,channel)) return false;
     if(fail_i2c) return false;
     uint16_t words[3]={0};
-    if(channel==0 && last_command[channel]==0xe4b8) words[0]=1;
-    else if(channel==0 && last_command[channel]==0xec05) { words[0]=600; words[1]=26000; words[2]=30000; }
-    else if(channel==1 && last_command[channel]==0xfd) { words[0]=25000; words[1]=31000; }
+    if(addr==0x62 && last_command[bus-1][addr]==0xe4b8) words[0]=1;
+    else if(addr==0x62 && last_command[bus-1][addr]==0xec05) { words[0]=600; words[1]=26000; words[2]=30000; }
+    else if((addr>=0x44 && addr<=0x46) && last_command[bus-1][addr]==0xfd) { words[0]=25000; words[1]=31000; }
+    else if((addr==0x25 || addr==0x26) && last_command[bus-1][addr]==0x3615) { words[0]=(uint16_t)-600; words[1]=5000; words[2]=60; }
     else return false;
     for(size_t i=0;i<n/3;i++) {
         data[i*3]=(uint8_t)(words[i]>>8); data[i*3+1]=(uint8_t)words[i];
@@ -55,7 +58,33 @@ void host_button(int pressed) { button=pressed!=0; }
 int host_led(void) { return led; }
 void host_fail(int i2c,int crc) { fail_i2c=i2c; bad_crc=crc; }
 uint16_t host_asc(void) { return asc; }
+int i2c_probe(uint8_t bus,uint8_t mux,uint8_t channel,uint8_t addr) {
+    if(!i2c_path_valid(bus,mux,channel)) return -1;
+    if(fail_i2c || bus==fail_scan_bus) return -1;
+    return bus==2?addr==0x25:(addr==0x44 || addr==0x62);
+}
+void host_fail_scan_bus(int bus) { fail_scan_bus=bus; }
 void host_feed(const uint8_t *data,size_t n) {
     if(n+incoming_len<=sizeof(incoming)) { memcpy(incoming+incoming_len,data,n); incoming_len+=n; }
 }
 size_t host_take(uint8_t *out) { size_t n=outgoing_len; memcpy(out,outgoing,n); outgoing_len=0; return n; }
+
+uint8_t i2c_muxes[2];
+bool i2c_path_valid(uint8_t bus,uint8_t mux,uint8_t channel) {
+    if(bus!=1 && bus!=2) return false;
+    return !mux?channel==255:(mux>=0x70 && mux<=0x77 && channel<8 && (i2c_muxes[bus-1]&(1U<<(mux-0x70))));
+}
+bool i2c_mux_set(uint8_t bus,uint8_t addr,bool enabled) {
+    if((bus!=1 && bus!=2) || addr<0x70 || addr>0x77) return false;
+    if(enabled) i2c_muxes[bus-1]|=1U<<(addr-0x70); else i2c_muxes[bus-1]&=~(1U<<(addr-0x70));
+    return true;
+}
+static uint8_t stored_config[CONFIG_BYTES];
+static bool stored_valid;
+bool config_load(uint8_t data[CONFIG_BYTES]) {
+    if(!stored_valid) return false;
+    memcpy(data,stored_config,CONFIG_BYTES); return true;
+}
+bool config_save(const uint8_t data[CONFIG_BYTES]) {
+    memcpy(stored_config,data,CONFIG_BYTES); stored_valid=true; return true;
+}
